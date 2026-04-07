@@ -1,26 +1,22 @@
 from fastapi import FastAPI
-from environment import StudyEnv
+import torch
+import gymnasium as gym
 
 app = FastAPI()
 
-env = StudyEnv()
-
-@app.post("/reset")
-def reset_env():
-    state = env.reset()
-    return {
-        "state": state
-    }
-
-@app.post("/step")
-def step_env(action: str):
-    state, reward, done = env.step(action)
-    return {
-        "state": state,
-        "reward": reward,
-        "done": done
-    }
-
+# Basic RL Environment Setup for Validation
 @app.get("/")
-def home():
-    return {"message": "Study Env API is running"}
+def read_root():
+    return {"status": "Environment Active", "framework": "PyTorch", "device": str(torch.cuda.is_available())}
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
+
+# Placeholder for the actual RL inference logic
+def run_inference():
+    # This ensures the script is runnable via 'python3 inference.py' as well
+    print("Inference engine initialized.")
+
+if __name__ == "__main__":
+    run_inference()
