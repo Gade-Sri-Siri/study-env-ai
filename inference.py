@@ -1,23 +1,26 @@
+from fastapi import FastAPI
 from environment import StudyEnv
-import random
 
-levels = ["easy", "medium", "hard"]
+app = FastAPI()
 
-for level in levels:
-    print(f"\nRunning Level: {level}")
-    
-    env = StudyEnv(level=level)
+env = StudyEnv()
+
+@app.post("/reset")
+def reset_env():
     state = env.reset()
-    
-    done = False
-    total_reward = 0
-    
-    actions = ["Math", "Python", "Physics", "DSA", "English", "AI", "Break"]
-    
-    while not done:
-        action = random.choice(actions)
-        state, reward, done = env.step(action)
-        total_reward += reward
-    
-    print("Final State:", state)
-    print("Total Reward:", total_reward)
+    return {
+        "state": state
+    }
+
+@app.post("/step")
+def step_env(action: str):
+    state, reward, done = env.step(action)
+    return {
+        "state": state,
+        "reward": reward,
+        "done": done
+    }
+
+@app.get("/")
+def home():
+    return {"message": "Study Env API is running"}
