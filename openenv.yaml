@@ -1,6 +1,6 @@
 version: "1.0"
 name: "study-env-ai"
-entrypoint: "python3 inference.py"
+entrypoint: "python3 app.py"
 type: "gymnasium"
 metadata:
   runtime: "python3.10"
