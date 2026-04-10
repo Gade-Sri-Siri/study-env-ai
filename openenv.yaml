@@ -1,7 +1,200 @@
-version: "1.0"
-name: "study-env-ai"
-entrypoint: "python3 app.py"
-type: "gymnasium"
-metadata:
-  runtime: "python3.10"
-  framework: "pytorch"
+name: study-planner
+version: "1.0.0"
+description: >
+  A real-world Study Planner environment where an AI agent manages a student's
+  study schedule across multiple subjects with deadlines. The agent must prioritize
+  tasks, allocate study time, manage energy, and complete work before deadlines.
+task_type: sequential_decision_making
+domain: education
+real_world: true
+
+observation_space:
+  type: object
+  description: "Current state of the study planner environment"
+  properties:
+    day:
+      type: integer
+      description: "Current day in the episode (1-indexed)"
+    max_days:
+      type: integer
+      description: "Maximum days allowed in the episode"
+    energy_level:
+      type: number
+      minimum: 0.0
+      maximum: 1.0
+      description: "Agent's current energy level (0=exhausted, 1=fully rested)"
+    subjects:
+      type: array
+      description: "List of subjects the agent must study"
+      items:
+        type: object
+        properties:
+          id:
+            type: string
+          name:
+            type: string
+          total_hours_needed:
+            type: number
+          hours_studied:
+            type: number
+          progress:
+            type: number
+            minimum: 0.0
+            maximum: 1.0
+          difficulty:
+            type: string
+            enum: [easy, medium, hard]
+          deadline_day:
+            type: integer
+          days_until_deadline:
+            type: integer
+    pending_tasks:
+      type: array
+      description: "List of incomplete tasks"
+      items:
+        type: object
+        properties:
+          id:
+            type: string
+          subject_id:
+            type: string
+          description:
+            type: string
+          estimated_hours:
+            type: number
+          priority:
+            type: string
+            enum: [low, medium, high]
+    completed_tasks_count:
+      type: integer
+    total_hours_studied:
+      type: number
+    overall_progress:
+      type: number
+      minimum: 0.0
+      maximum: 1.0
+    days_remaining:
+      type: integer
+    urgent_subjects:
+      type: array
+      items:
+        type: string
+      description: "Subjects with deadlines within 2 days and <80% progress"
+
+action_space:
+  type: object
+  description: "Actions available to the agent"
+  properties:
+    action_type:
+      type: string
+      enum: [study, create_task, complete_task, rest, review_schedule]
+      description: |
+        - study: Allocate hours to study a specific subject
+        - create_task: Create a new task for a subject
+        - complete_task: Mark an existing task as complete
+        - rest: Rest to recover energy
+        - review_schedule: Review and reorganize schedule (costs 1 day)
+    payload:
+      type: object
+      description: "Action-specific parameters"
+      oneOf:
+        - description: "study payload"
+          properties:
+            subject_id:
+              type: string
+            hours:
+              type: number
+              minimum: 0.1
+              maximum: 4.0
+        - description: "create_task payload"
+          properties:
+            subject_id:
+              type: string
+            description:
+              type: string
+            estimated_hours:
+              type: number
+            priority:
+              type: string
+              enum: [low, medium, high]
+        - description: "complete_task payload"
+          properties:
+            task_id:
+              type: string
+        - description: "rest payload"
+          properties:
+            hours:
+              type: number
+              minimum: 1.0
+              maximum: 8.0
+        - description: "review_schedule payload"
+          properties: {}
+
+reward:
+  type: number
+  range: [-1.0, 1.0]
+  description: >
+    Reward signal with partial progress:
+    - Progress reward: proportional to study progress per step
+    - Task completion bonus: +0.1 (low), +0.2 (medium), +0.5 (high priority)
+    - Rest efficiency: +0.3 when energy < 30%, -0.1 when energy > 50%
+    - Study efficiency: +0.1 when energy > 50% and studying >= 1h
+    - Deadline miss penalty: -deficit per overdue subject
+
+graders:
+  - name: easy
+    description: "Did the agent study at all? (>10% overall progress)"
+    threshold: 0.1
+    reward_range: [0.0, 1.0]
+  - name: medium
+    description: "Did the agent make meaningful progress? (>50% overall progress)"
+    threshold: 0.5
+    reward_range: [0.0, 1.0]
+  - name: hard
+    description: "Did the agent complete everything on time? (>90% progress, minimal missed deadlines)"
+    threshold: 0.8
+    reward_range: [0.0, 1.0]
+
+episodes:
+  max_steps_per_day: 10
+  max_days: 14
+  difficulty_levels:
+    easy:
+      subjects: 3
+      total_hours: 24
+      deadlines: relaxed
+    medium:
+      subjects: 4
+      total_hours: 55
+      deadlines: moderate
+    hard:
+      subjects: 5
+      total_hours: 108
+      deadlines: tight
+
+api:
+  reset:
+    method: POST
+    path: /reset
+    body:
+      difficulty:
+        type: string
+        enum: [easy, medium, hard]
+        default: medium
+      seed:
+        type: integer
+        nullable: true
+  step:
+    method: POST
+    path: /step
+    body:
+      action:
+        type: object
+        properties:
+          action_type:
+            type: string
+          payload:
+            type: object
+  state:
+    method: GET
+    path: /state
