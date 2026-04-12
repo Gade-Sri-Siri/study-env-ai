@@ -1,10 +1,4 @@
-fastapi==0.115.6
-uvicorn[standard]==0.32.1
-pydantic==2.10.3
-python-multipart==0.0.20
-openai>=1.0.0
-requests
-2. inference.py (Complete File with LLM Integration)
+
 """
 Study Planner OpenEnv - inference.py
 FastAPI server implementing the OpenEnv spec: reset(), step(), state() API.
