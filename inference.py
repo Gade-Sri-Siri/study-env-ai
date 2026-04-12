@@ -17,6 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
+
 # ─── Domain Models ────────────────────────────────────────────────────────────
 
 class Subject(BaseModel):
@@ -25,7 +26,7 @@ class Subject(BaseModel):
     total_hours_needed: float
     hours_studied: float = 0.0
     difficulty: Literal["easy", "medium", "hard"] = "medium"
-    deadline_day: int = 7  # days from episode start
+    deadline_day: int = 7
 
 
 class Task(BaseModel):
@@ -53,7 +54,7 @@ class StudyPlannerState(BaseModel):
     tasks: List[Task] = Field(default_factory=list)
     completed_sessions: List[Dict[str, Any]] = Field(default_factory=list)
     total_hours_studied: float = 0.0
-    energy_level: float = 1.0  # 0.0 to 1.0
+    energy_level: float = 1.0
     score: float = 0.0
     done: bool = False
     info: Dict[str, Any] = Field(default_factory=dict)
@@ -169,17 +170,13 @@ def _make_observation(state: StudyPlannerState) -> Observation:
         for t in state.tasks if not t.completed
     ]
     completed_count = sum(1 for t in state.tasks if t.completed)
-
     total_needed = sum(s.total_hours_needed for s in state.subjects)
     total_studied = sum(s.hours_studied for s in state.subjects)
-    overall_progress = (total_studied / total_needed) if total_needed > 0 else 0.0
-    overall_progress = min(overall_progress, 1.0)
-
+    overall_progress = min((total_studied / total_needed) if total_needed > 0 else 0.0, 1.0)
     urgent_subjects = [
         s.name for s in state.subjects
         if (s.deadline_day - state.day) <= 2 and (s.hours_studied / s.total_hours_needed) < 0.8
     ]
-
     return Observation(
         day=state.day,
         max_days=state.max_days,
@@ -210,75 +207,51 @@ def _compute_reward(
     state: StudyPlannerState, action: Action, prev_progress: float, new_progress: float
 ) -> float:
     reward = 0.0
-
-    progress_delta = new_progress - prev_progress
-    reward += progress_delta * 5.0
-
+    reward += (new_progress - prev_progress) * 5.0
     if action.action_type == "complete_task":
         task_id = (action.payload or {}).get("task_id")
         task = next((t for t in state.tasks if t.id == task_id), None)
         if task and task.completed:
-            priority_bonus = {"low": 0.1, "medium": 0.2, "high": 0.5}.get(task.priority, 0.1)
-            reward += priority_bonus
-
+            reward += {"low": 0.1, "medium": 0.2, "high": 0.5}.get(task.priority, 0.1)
     if action.action_type == "rest":
-        if state.energy_level < 0.3:
-            reward += 0.3
-        else:
-            reward -= 0.1
-
+        reward += 0.3 if state.energy_level < 0.3 else -0.1
     if action.action_type == "study":
         hours = (action.payload or {}).get("hours", 1.0)
         if state.energy_level > 0.5 and hours >= 1.0:
             reward += 0.1
-
     for subject in state.subjects:
-        days_left = subject.deadline_day - state.day
-        progress = subject.hours_studied / subject.total_hours_needed
-        if days_left <= 0 and progress < 1.0:
-            deficit = 1.0 - progress
-            reward -= deficit * 1.0
-
-    reward = float(max(-1.0, min(1.0, reward)))
-    return round(reward, 4)
+        if (subject.deadline_day - state.day) <= 0 and (subject.hours_studied / subject.total_hours_needed) < 1.0:
+            reward -= (1.0 - subject.hours_studied / subject.total_hours_needed) * 1.0
+    return round(float(max(-1.0, min(1.0, reward))), 4)
 
 
 def _initialize_state(difficulty: str, seed: Optional[int]) -> StudyPlannerState:
     if seed is not None:
         random.seed(seed)
-
     config = DIFFICULTY_CONFIGS.get(difficulty, DIFFICULTY_CONFIGS["medium"])
     episode_id = str(uuid.uuid4())
-
     subjects = []
     tasks = []
-
     for subj_conf in config["subjects"]:
         subj_id = str(uuid.uuid4())
-        subject = Subject(
+        subjects.append(Subject(
             id=subj_id,
             name=subj_conf["name"],
             total_hours_needed=subj_conf["total_hours"],
             difficulty=subj_conf["difficulty"],
             deadline_day=subj_conf["deadline_day"],
-        )
-        subjects.append(subject)
-
+        ))
         templates = TASK_TEMPLATES.get(subj_conf["name"], ["Study material", "Review notes", "Practice problems"])
         n_tasks = config["initial_tasks_per_subject"]
         selected = templates[:n_tasks] if len(templates) >= n_tasks else templates
-
         for i, desc in enumerate(selected):
-            priority_map = ["high", "medium", "low"]
-            task = Task(
+            tasks.append(Task(
                 id=str(uuid.uuid4()),
                 subject_id=subj_id,
                 description=desc,
                 estimated_hours=round(subj_conf["total_hours"] / n_tasks, 1),
-                priority=priority_map[i % 3],
-            )
-            tasks.append(task)
-
+                priority=["high", "medium", "low"][i % 3],
+            ))
     return StudyPlannerState(
         episode_id=episode_id,
         day=1,
@@ -292,78 +265,56 @@ def _initialize_state(difficulty: str, seed: Optional[int]) -> StudyPlannerState
 
 def _apply_action(state: StudyPlannerState, action: Action) -> str:
     payload = action.payload or {}
-    message = ""
 
     if action.action_type == "study":
         subject_id = payload.get("subject_id")
-        hours = float(payload.get("hours", 1.0))
-        hours = max(0.1, min(hours, 4.0))
-
+        hours = max(0.1, min(float(payload.get("hours", 1.0)), 4.0))
         subject = next((s for s in state.subjects if s.id == subject_id), None)
         if subject is None:
             raise HTTPException(status_code=400, detail=f"Subject '{subject_id}' not found")
-
         if state.energy_level < 0.1:
             raise HTTPException(status_code=400, detail="Energy too low to study. Rest first.")
-
-        quality_multiplier = 0.7 + (state.energy_level * 0.6)
-        effective_hours = hours * quality_multiplier
+        effective_hours = hours * (0.7 + state.energy_level * 0.6)
         subject.hours_studied = min(subject.hours_studied + effective_hours, subject.total_hours_needed)
         state.total_hours_studied += effective_hours
-
-        state.energy_level = max(0.0, state.energy_level - (hours * 0.15))
+        state.energy_level = max(0.0, state.energy_level - hours * 0.15)
         state.day += 1
-        message = f"Studied {subject.name} for {hours}h (effective: {round(effective_hours, 2)}h)"
+        return f"Studied {subject.name} for {hours}h (effective: {round(effective_hours, 2)}h)"
 
     elif action.action_type == "create_task":
         subject_id = payload.get("subject_id")
-        description = payload.get("description", "New task")
-        estimated_hours = float(payload.get("estimated_hours", 1.0))
-        priority = payload.get("priority", "medium")
-
         subject = next((s for s in state.subjects if s.id == subject_id), None)
         if subject is None:
             raise HTTPException(status_code=400, detail=f"Subject '{subject_id}' not found")
-
-        new_task = Task(
+        state.tasks.append(Task(
             id=str(uuid.uuid4()),
             subject_id=subject_id,
-            description=description,
-            estimated_hours=estimated_hours,
-            priority=priority,
-        )
-        state.tasks.append(new_task)
-        message = f"Created task: {description} for {subject.name}"
+            description=payload.get("description", "New task"),
+            estimated_hours=float(payload.get("estimated_hours", 1.0)),
+            priority=payload.get("priority", "medium"),
+        ))
+        return f"Created task for {subject.name}"
 
     elif action.action_type == "complete_task":
         task_id = payload.get("task_id")
         task = next((t for t in state.tasks if t.id == task_id), None)
         if task is None:
             raise HTTPException(status_code=400, detail=f"Task '{task_id}' not found")
-        if task.completed:
-            message = f"Task already completed: {task.description}"
-        else:
+        if not task.completed:
             task.completed = True
-            subject = next((s for s in state.subjects if s.id == task.subject_id), None)
-            subj_name = subject.name if subject else "Unknown"
-            message = f"Completed task: {task.description} ({subj_name})"
+        return f"Completed task: {task.description}"
 
     elif action.action_type == "rest":
         state.energy_level = min(1.0, state.energy_level + 0.3)
         state.day += 1
-        message = f"Rested. Energy restored to {round(state.energy_level, 2)}"
+        return f"Rested. Energy restored to {round(state.energy_level, 2)}"
 
     elif action.action_type == "review_schedule":
-        pending_count = sum(1 for t in state.tasks if not t.completed)
-        message = (
-            f"Schedule review: Day {state.day}/{state.max_days}, "
-            f"{pending_count} pending tasks, energy={round(state.energy_level, 2)}"
-        )
+        pending = sum(1 for t in state.tasks if not t.completed)
+        return f"Review: Day {state.day}/{state.max_days}, {pending} pending, energy={round(state.energy_level, 2)}"
 
     else:
         raise HTTPException(status_code=400, detail=f"Unknown action type: {action.action_type}")
-
-    return message
 
 
 def _check_done(state: StudyPlannerState) -> bool:
@@ -371,30 +322,24 @@ def _check_done(state: StudyPlannerState) -> bool:
         return True
     total_needed = sum(s.total_hours_needed for s in state.subjects)
     total_studied = sum(s.hours_studied for s in state.subjects)
-    if total_needed > 0 and (total_studied / total_needed) >= 1.0:
-        return True
-    return False
+    return total_needed > 0 and (total_studied / total_needed) >= 1.0
 
 
 def _compute_final_score(state: StudyPlannerState) -> Dict[str, float]:
     total_needed = sum(s.total_hours_needed for s in state.subjects)
     total_studied = sum(s.hours_studied for s in state.subjects)
     completion_ratio = min((total_studied / total_needed) if total_needed > 0 else 0.0, 1.0)
-
     tasks_completed = sum(1 for t in state.tasks if t.completed)
-    tasks_total = len(state.tasks)
-    task_ratio = (tasks_completed / tasks_total) if tasks_total > 0 else 0.0
-
-    deadline_score = 0.0
-    for subject in state.subjects:
-        progress = subject.hours_studied / subject.total_hours_needed
-        deadline_score += progress if state.day <= subject.deadline_day else progress * 0.5
-    deadline_score = deadline_score / len(state.subjects) if state.subjects else 0.0
-
+    task_ratio = (tasks_completed / len(state.tasks)) if state.tasks else 0.0
+    deadline_score = sum(
+        (s.hours_studied / s.total_hours_needed) if state.day <= s.deadline_day
+        else (s.hours_studied / s.total_hours_needed) * 0.5
+        for s in state.subjects
+    ) / len(state.subjects) if state.subjects else 0.0
     return {
         "easy": round(min(1.0, completion_ratio), 4),
-        "medium": round(min(1.0, (completion_ratio * 0.6) + (task_ratio * 0.2) + (deadline_score * 0.2)), 4),
-        "hard": round(min(1.0, (completion_ratio * 0.5) + (task_ratio * 0.2) + (deadline_score * 0.3)), 4),
+        "medium": round(min(1.0, completion_ratio * 0.6 + task_ratio * 0.2 + deadline_score * 0.2), 4),
+        "hard": round(min(1.0, completion_ratio * 0.5 + task_ratio * 0.2 + deadline_score * 0.3), 4),
         "completion_ratio": round(completion_ratio, 4),
         "task_completion_ratio": round(task_ratio, 4),
         "deadline_score": round(deadline_score, 4),
@@ -425,7 +370,6 @@ def healthz():
 
 @app.post("/reset", response_model=ResetResponse)
 def reset(req: Optional[ResetRequest] = Body(default=None)):
-    """Initialize or reset the environment for a new episode."""
     global _state
     if req is None:
         req = ResetRequest()
@@ -436,7 +380,6 @@ def reset(req: Optional[ResetRequest] = Body(default=None)):
         _state = _initialize_state(difficulty, req.seed)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to initialize state: {str(e)}")
-
     obs = _make_observation(_state)
     return ResetResponse(
         observation=obs,
@@ -451,40 +394,29 @@ def reset(req: Optional[ResetRequest] = Body(default=None)):
 
 @app.post("/step", response_model=StepResponse)
 def step(req: StepRequest):
-    """Execute one action in the environment."""
     global _state
     if _state is None:
         raise HTTPException(status_code=400, detail="Environment not initialized. Call /reset first.")
-
     if _state.done:
         raise HTTPException(status_code=400, detail="Episode is done. Call /reset to start a new episode.")
-
     total_needed = sum(s.total_hours_needed for s in _state.subjects)
-    total_studied_before = sum(s.hours_studied for s in _state.subjects)
-    prev_progress = total_studied_before / total_needed if total_needed > 0 else 0.0
-
+    prev_progress = sum(s.hours_studied for s in _state.subjects) / total_needed if total_needed > 0 else 0.0
     try:
         message = _apply_action(_state, req.action)
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Action failed: {str(e)}")
-
-    total_studied_after = sum(s.hours_studied for s in _state.subjects)
-    new_progress = total_studied_after / total_needed if total_needed > 0 else 0.0
-
+    new_progress = sum(s.hours_studied for s in _state.subjects) / total_needed if total_needed > 0 else 0.0
     reward = _compute_reward(_state, req.action, prev_progress, new_progress)
     _state.score += reward
     _state.done = _check_done(_state)
-
     obs = _make_observation(_state)
-
     info: Dict[str, Any] = {
         "message": message,
         "cumulative_score": round(_state.score, 4),
         "episode_id": _state.episode_id,
     }
-
     if _state.done:
         final_scores = _compute_final_score(_state)
         info["final_scores"] = final_scores
@@ -493,13 +425,11 @@ def step(req: StepRequest):
             "medium": {"score": final_scores["medium"], "passed": final_scores["medium"] >= 0.5},
             "hard": {"score": final_scores["hard"], "passed": final_scores["hard"] >= 0.8},
         }
-
     return StepResponse(observation=obs, reward=reward, done=_state.done, info=info)
 
 
 @app.get("/state")
 def state():
-    """Get the current raw environment state."""
     global _state
     if _state is None:
         raise HTTPException(status_code=400, detail="Environment not initialized. Call /reset first.")
@@ -508,10 +438,86 @@ def state():
 
 @app.get("/openenv.yaml", include_in_schema=False)
 def serve_openenv_yaml():
-    """Serve the openenv.yaml spec file."""
     yaml_path = os.path.join(os.path.dirname(__file__), "openenv.yaml")
     if os.path.exists(yaml_path):
         with open(yaml_path) as f:
             content = f.read()
         return Response(content=content, media_type="text/yaml")
     raise HTTPException(status_code=404, detail="openenv.yaml not found")
+
+
+# ─── Agent Runner (Scaler calls: python inference.py) ─────────────────────────
+
+if __name__ == "__main__":
+    import sys
+    import urllib.request
+    import urllib.error
+
+    PORT = int(os.environ.get("PORT", 7860))
+    BASE_URL = f"http://localhost:{PORT}"
+    TASK_NAME = "study-planner"
+
+    def _api_post(path: str, data: dict = None) -> dict:
+        body = json.dumps(data or {}).encode()
+        req = urllib.request.Request(
+            f"{BASE_URL}{path}",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read())
+
+    # Wait up to 60s for uvicorn server (started by Docker CMD) to be ready
+    server_ready = False
+    for _ in range(60):
+        try:
+            urllib.request.urlopen(f"{BASE_URL}/healthz", timeout=2)
+            server_ready = True
+            break
+        except Exception:
+            time.sleep(1)
+
+    if not server_ready:
+        print(f"[START] task={TASK_NAME}", flush=True)
+        print(f"[END] task={TASK_NAME} score=0.0 steps=0", flush=True)
+        sys.exit(1)
+
+    print(f"[START] task={TASK_NAME}", flush=True)
+
+    resp = _api_post("/reset", {"difficulty": "easy"})
+    observation = resp["observation"]
+
+    step_num = 0
+    last_step_data: dict = {}
+    done = False
+
+    while not done and step_num < 100:
+        energy = observation["energy_level"]
+        subjects = observation["subjects"]
+
+        if energy < 0.25:
+            action = {"action_type": "rest", "payload": {}}
+        else:
+            best = max(subjects, key=lambda s: s["total_hours_needed"] - s["hours_studied"])
+            action = {
+                "action_type": "study",
+                "payload": {"subject_id": best["id"], "hours": 2.0},
+            }
+
+        try:
+            last_step_data = _api_post("/step", {"action": action})
+        except Exception:
+            print(f"[STEP] step={step_num + 1} reward=0.0", flush=True)
+            break
+
+        reward = last_step_data.get("reward", 0.0)
+        done = last_step_data.get("done", False)
+        observation = last_step_data.get("observation", observation)
+        step_num += 1
+        print(f"[STEP] step={step_num} reward={round(reward, 4)}", flush=True)
+
+    info = last_step_data.get("info", {})
+    final_scores = info.get("final_scores", {})
+    score = final_scores.get("easy", round(info.get("cumulative_score", 0.0), 4))
+    print(f"[END] task={TASK_NAME} score={round(score, 4)} steps={step_num}", flush=True)
