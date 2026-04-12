@@ -18,4 +18,4 @@ ENV PYTHONDONTWRITEBYTECODE=1
 
 EXPOSE 7860
 
-CMD ["python", "inference.py"]
+CMD ["uvicorn", "inference:app", "--host", "0.0.0.0", "--port", "7860"]
