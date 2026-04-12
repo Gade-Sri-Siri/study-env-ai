@@ -6,6 +6,7 @@ FastAPI server implementing the OpenEnv spec: reset(), step(), state() API.
 from __future__ import annotations
 
 import json
+import os
 import random
 import time
 import uuid
@@ -13,7 +14,7 @@ from typing import Any, Dict, List, Optional, Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
 # ─── Domain Models ────────────────────────────────────────────────────────────
@@ -205,19 +206,16 @@ def _make_observation(state: StudyPlannerState) -> Observation:
     )
 
 
-def _compute_reward(state: StudyPlannerState, action: Action, prev_progress: float, new_progress: float) -> float:
+def _compute_reward(
+    state: StudyPlannerState, action: Action, prev_progress: float, new_progress: float
+) -> float:
     """
-    Reward function with partial progress signals:
-    - Progress reward: proportional to study progress made
-    - Task completion bonus
-    - Deadline penalty for missed/late work
-    - Energy management bonus
-    - Efficiency bonus for matching task priority to study
+    Reward function with partial progress signals.
     """
     reward = 0.0
 
     progress_delta = new_progress - prev_progress
-    reward += progress_delta * 5.0  # 0-5 range for full coverage
+    reward += progress_delta * 5.0
 
     if action.action_type == "complete_task":
         task_id = (action.payload or {}).get("task_id")
@@ -235,14 +233,14 @@ def _compute_reward(state: StudyPlannerState, action: Action, prev_progress: flo
     if action.action_type == "study":
         hours = (action.payload or {}).get("hours", 1.0)
         if state.energy_level > 0.5 and hours >= 1.0:
-            reward += 0.1  # efficiency bonus
+            reward += 0.1
 
     for subject in state.subjects:
         days_left = subject.deadline_day - state.day
         progress = subject.hours_studied / subject.total_hours_needed
         if days_left <= 0 and progress < 1.0:
             deficit = 1.0 - progress
-            reward -= deficit * 1.0  # miss penalty
+            reward -= deficit * 1.0
 
     reward = float(max(-1.0, min(1.0, reward)))
     return round(reward, 4)
@@ -295,15 +293,15 @@ def _initialize_state(difficulty: str, seed: Optional[int]) -> StudyPlannerState
     )
 
 
-def _apply_action(state: StudyPlannerState, action: Action) -> tuple[float, str]:
-    """Apply action to state and return (reward_delta_progress_before, message)."""
+def _apply_action(state: StudyPlannerState, action: Action) -> str:
+    """Apply action to state in-place and return a message string."""
     payload = action.payload or {}
     message = ""
 
     if action.action_type == "study":
         subject_id = payload.get("subject_id")
         hours = float(payload.get("hours", 1.0))
-        hours = max(0.1, min(hours, 4.0))  # clamp 0.1-4h per session
+        hours = max(0.1, min(hours, 4.0))
 
         subject = next((s for s in state.subjects if s.id == subject_id), None)
         if subject is None:
@@ -347,27 +345,28 @@ def _apply_action(state: StudyPlannerState, action: Action) -> tuple[float, str]
         if task is None:
             raise HTTPException(status_code=400, detail=f"Task '{task_id}' not found")
         if task.completed:
-            raise HTTPException(status_code=400, detail="Task already completed")
-
-        task.completed = True
-        subject = next((s for s in state.subjects if s.id == task.subject_id), None)
-        if subject:
-            credit = task.estimated_hours * 0.3
-            subject.hours_studied = min(subject.hours_studied + credit, subject.total_hours_needed)
-            state.total_hours_studied += credit
-        message = f"Completed task: {task.description}"
+            message = f"Task already completed: {task.description}"
+        else:
+            task.completed = True
+            subject = next((s for s in state.subjects if s.id == task.subject_id), None)
+            subj_name = subject.name if subject else "Unknown"
+            message = f"Completed task: {task.description} ({subj_name})"
 
     elif action.action_type == "rest":
-        rest_hours = float(payload.get("hours", 4.0))
-        rest_hours = max(1.0, min(rest_hours, 8.0))
-        energy_gain = rest_hours * 0.15
-        state.energy_level = min(1.0, state.energy_level + energy_gain)
+        rest_recovery = 0.3
+        state.energy_level = min(1.0, state.energy_level + rest_recovery)
         state.day += 1
-        message = f"Rested for {rest_hours}h, energy: {round(state.energy_level, 2)}"
+        message = f"Rested. Energy restored to {round(state.energy_level, 2)}"
 
     elif action.action_type == "review_schedule":
-        state.day += 1
-        message = "Reviewed and reorganized study schedule"
+        pending_count = sum(1 for t in state.tasks if not t.completed)
+        message = (
+            f"Schedule review: Day {state.day}/{state.max_days}, "
+            f"{pending_count} pending tasks, energy={round(state.energy_level, 2)}"
+        )
+
+    else:
+        raise HTTPException(status_code=400, detail=f"Unknown action type: {action.action_type}")
 
     return message
 
@@ -375,57 +374,52 @@ def _apply_action(state: StudyPlannerState, action: Action) -> tuple[float, str]
 def _check_done(state: StudyPlannerState) -> bool:
     if state.day > state.max_days:
         return True
-    all_done = all(s.hours_studied >= s.total_hours_needed for s in state.subjects)
-    if all_done:
+    total_needed = sum(s.total_hours_needed for s in state.subjects)
+    total_studied = sum(s.hours_studied for s in state.subjects)
+    if total_needed > 0 and (total_studied / total_needed) >= 1.0:
         return True
     return False
 
 
 def _compute_final_score(state: StudyPlannerState) -> Dict[str, float]:
-    """
-    Grader scores for easy/medium/hard tasks:
-    - Easy: did you study at all? (>10% progress)
-    - Medium: did you make meaningful progress? (>50% progress)
-    - Hard: did you complete everything on time? (>90% before deadlines)
-    """
     total_needed = sum(s.total_hours_needed for s in state.subjects)
     total_studied = sum(s.hours_studied for s in state.subjects)
-    overall_progress = total_studied / total_needed if total_needed > 0 else 0.0
+    completion_ratio = (total_studied / total_needed) if total_needed > 0 else 0.0
+    completion_ratio = min(completion_ratio, 1.0)
 
-    easy_score = min(1.0, overall_progress / 0.1) if overall_progress <= 0.1 else 1.0
-    medium_score = min(1.0, overall_progress / 0.5)
-    hard_score = min(1.0, overall_progress / 0.9)
+    tasks_completed = sum(1 for t in state.tasks if t.completed)
+    tasks_total = len(state.tasks)
+    task_ratio = (tasks_completed / tasks_total) if tasks_total > 0 else 0.0
 
-    on_time_subjects = 0
-    for s in state.subjects:
-        progress = s.hours_studied / s.total_hours_needed
-        if progress >= 0.9:
-            on_time_subjects += 1
+    deadline_score = 0.0
+    for subject in state.subjects:
+        progress = subject.hours_studied / subject.total_hours_needed
+        if state.day <= subject.deadline_day:
+            deadline_score += progress
+        else:
+            deadline_score += progress * 0.5
+    deadline_score = deadline_score / len(state.subjects) if state.subjects else 0.0
 
-    on_time_ratio = on_time_subjects / len(state.subjects) if state.subjects else 0.0
-    hard_score = (hard_score + on_time_ratio) / 2.0
-
-    tasks_done = sum(1 for t in state.tasks if t.completed)
-    task_ratio = tasks_done / len(state.tasks) if state.tasks else 0.0
+    easy_score = min(1.0, completion_ratio)
+    medium_score = min(1.0, (completion_ratio * 0.6) + (task_ratio * 0.2) + (deadline_score * 0.2))
+    hard_score = min(1.0, (completion_ratio * 0.5) + (task_ratio * 0.2) + (deadline_score * 0.3))
 
     return {
-        "easy": round(min(1.0, easy_score), 4),
-        "medium": round(min(1.0, medium_score), 4),
-        "hard": round(min(1.0, hard_score), 4),
-        "overall_progress": round(overall_progress, 4),
-        "tasks_completed_ratio": round(task_ratio, 4),
-        "on_time_ratio": round(on_time_ratio, 4),
-        "days_used": state.day,
-        "total_hours_studied": round(state.total_hours_studied, 2),
+        "easy": round(easy_score, 4),
+        "medium": round(medium_score, 4),
+        "hard": round(hard_score, 4),
+        "completion_ratio": round(completion_ratio, 4),
+        "task_completion_ratio": round(task_ratio, 4),
+        "deadline_score": round(deadline_score, 4),
     }
 
 
-# ─── FastAPI App ──────────────────────────────────────────────────────────────
+# ─── FastAPI App ───────────────────────────────────────────────────────────────
 
 app = FastAPI(
     title="Study Planner OpenEnv",
-    description="A real-world Study Planner environment for AI agent training via OpenEnv spec.",
-    version="1.0.0",
+    description="An OpenEnv-compatible study planner environment for AI agent training.",
+    version="1.0.1",
 )
 
 app.add_middleware(
@@ -437,30 +431,23 @@ app.add_middleware(
 )
 
 
-@app.get("/")
-def root():
-    return {
-        "name": "Study Planner OpenEnv",
-        "version": "1.0.0",
-        "description": "AI agent training environment for study planning tasks",
-        "endpoints": {
-            "POST /reset": "Initialize a new episode",
-            "POST /step": "Execute an action",
-            "GET /state": "Get current environment state",
-        },
-    }
-
-
-@app.get("/health")
-def health():
-    return {"status": "ok", "timestamp": time.time()}
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok"}
 
 
 @app.post("/reset", response_model=ResetResponse)
-def reset(req: ResetRequest = ResetRequest()):
-    """Initialize or restart the environment. Returns initial observation."""
+def reset(req: ResetRequest):
+    """Initialize or reset the environment for a new episode."""
     global _state
-    _state = _initialize_state(req.difficulty or "medium", req.seed)
+    difficulty = req.difficulty or "medium"
+    if difficulty not in DIFFICULTY_CONFIGS:
+        raise HTTPException(status_code=400, detail=f"Unknown difficulty: {difficulty}")
+    try:
+        _state = _initialize_state(difficulty, req.seed)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to initialize state: {str(e)}")
+
     obs = _make_observation(_state)
     return ResetResponse(
         observation=obs,
@@ -479,6 +466,7 @@ def step(req: StepRequest):
     global _state
     if _state is None:
         raise HTTPException(status_code=400, detail="Environment not initialized. Call /reset first.")
+
     if _state.done:
         raise HTTPException(status_code=400, detail="Episode is done. Call /reset to start a new episode.")
 
@@ -486,7 +474,12 @@ def step(req: StepRequest):
     total_studied_before = sum(s.hours_studied for s in _state.subjects)
     prev_progress = total_studied_before / total_needed if total_needed > 0 else 0.0
 
-    message = _apply_action(_state, req.action)
+    try:
+        message = _apply_action(_state, req.action)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Action failed: {str(e)}")
 
     total_studied_after = sum(s.hours_studied for s in _state.subjects)
     new_progress = total_studied_after / total_needed if total_needed > 0 else 0.0
@@ -496,11 +489,13 @@ def step(req: StepRequest):
     _state.done = _check_done(_state)
 
     obs = _make_observation(_state)
+
     info: Dict[str, Any] = {
         "message": message,
         "cumulative_score": round(_state.score, 4),
         "episode_id": _state.episode_id,
     }
+
     if _state.done:
         final_scores = _compute_final_score(_state)
         info["final_scores"] = final_scores
@@ -525,18 +520,16 @@ def state():
 @app.get("/openenv.yaml", include_in_schema=False)
 def serve_openenv_yaml():
     """Serve the openenv.yaml spec file."""
-    import os
     yaml_path = os.path.join(os.path.dirname(__file__), "openenv.yaml")
     if os.path.exists(yaml_path):
         with open(yaml_path) as f:
             content = f.read()
-        from fastapi.responses import Response
         return Response(content=content, media_type="text/yaml")
     raise HTTPException(status_code=404, detail="openenv.yaml not found")
 
 
 if __name__ == "__main__":
     import uvicorn
-    import os
+
     port = int(os.environ.get("PORT", 7860))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
