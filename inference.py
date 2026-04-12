@@ -85,9 +85,9 @@ class Observation(BaseModel):
     pending_tasks: List[Dict[str, Any]]
     completed_tasks_count: int
     total_hours_studied: float
-    overall_progress: float  # 0.0 to 1.0
+    overall_progress: float
     days_remaining: int
-    urgent_subjects: List[str]  # subjects with deadlines approaching
+    urgent_subjects: List[str]
 
 
 class StepResponse(BaseModel):
@@ -209,9 +209,6 @@ def _make_observation(state: StudyPlannerState) -> Observation:
 def _compute_reward(
     state: StudyPlannerState, action: Action, prev_progress: float, new_progress: float
 ) -> float:
-    """
-    Reward function with partial progress signals.
-    """
     reward = 0.0
 
     progress_delta = new_progress - prev_progress
@@ -294,7 +291,6 @@ def _initialize_state(difficulty: str, seed: Optional[int]) -> StudyPlannerState
 
 
 def _apply_action(state: StudyPlannerState, action: Action) -> str:
-    """Apply action to state in-place and return a message string."""
     payload = action.payload or {}
     message = ""
 
@@ -353,8 +349,7 @@ def _apply_action(state: StudyPlannerState, action: Action) -> str:
             message = f"Completed task: {task.description} ({subj_name})"
 
     elif action.action_type == "rest":
-        rest_recovery = 0.3
-        state.energy_level = min(1.0, state.energy_level + rest_recovery)
+        state.energy_level = min(1.0, state.energy_level + 0.3)
         state.day += 1
         message = f"Rested. Energy restored to {round(state.energy_level, 2)}"
 
@@ -384,8 +379,7 @@ def _check_done(state: StudyPlannerState) -> bool:
 def _compute_final_score(state: StudyPlannerState) -> Dict[str, float]:
     total_needed = sum(s.total_hours_needed for s in state.subjects)
     total_studied = sum(s.hours_studied for s in state.subjects)
-    completion_ratio = (total_studied / total_needed) if total_needed > 0 else 0.0
-    completion_ratio = min(completion_ratio, 1.0)
+    completion_ratio = min((total_studied / total_needed) if total_needed > 0 else 0.0, 1.0)
 
     tasks_completed = sum(1 for t in state.tasks if t.completed)
     tasks_total = len(state.tasks)
@@ -394,20 +388,13 @@ def _compute_final_score(state: StudyPlannerState) -> Dict[str, float]:
     deadline_score = 0.0
     for subject in state.subjects:
         progress = subject.hours_studied / subject.total_hours_needed
-        if state.day <= subject.deadline_day:
-            deadline_score += progress
-        else:
-            deadline_score += progress * 0.5
+        deadline_score += progress if state.day <= subject.deadline_day else progress * 0.5
     deadline_score = deadline_score / len(state.subjects) if state.subjects else 0.0
 
-    easy_score = min(1.0, completion_ratio)
-    medium_score = min(1.0, (completion_ratio * 0.6) + (task_ratio * 0.2) + (deadline_score * 0.2))
-    hard_score = min(1.0, (completion_ratio * 0.5) + (task_ratio * 0.2) + (deadline_score * 0.3))
-
     return {
-        "easy": round(easy_score, 4),
-        "medium": round(medium_score, 4),
-        "hard": round(hard_score, 4),
+        "easy": round(min(1.0, completion_ratio), 4),
+        "medium": round(min(1.0, (completion_ratio * 0.6) + (task_ratio * 0.2) + (deadline_score * 0.2)), 4),
+        "hard": round(min(1.0, (completion_ratio * 0.5) + (task_ratio * 0.2) + (deadline_score * 0.3)), 4),
         "completion_ratio": round(completion_ratio, 4),
         "task_completion_ratio": round(task_ratio, 4),
         "deadline_score": round(deadline_score, 4),
@@ -528,5 +515,3 @@ def serve_openenv_yaml():
             content = f.read()
         return Response(content=content, media_type="text/yaml")
     raise HTTPException(status_code=404, detail="openenv.yaml not found")
-
-
